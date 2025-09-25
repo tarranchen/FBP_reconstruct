@@ -12,16 +12,16 @@ from scipy.special import erf
 # --- 參數設定 (請根據您的需求修改) ---
 
 # 輸入資料夾：包含 .tiff 投影影像的資料夾路徑
-INPUT_DIR = './P'
+INPUT_DIR = './projections'
 
 # 檔案搜尋模式：用來尋找所有投影影像檔案
 FILE_PATTERN = '*.tif'
 
 # 輸出檔案：重建後的 3D 體積將儲存為一個多頁的 TIFF 檔案
-OUTPUT_FILE = 'reconstructed_volume_v6_B2S1L1.tif'
+OUTPUT_FILE = 'M4_B1S1L1.tif'
 
 # 像素合併因子 (Binning Factor)
-BINNING_FACTOR = 2
+BINNING_FACTOR = 1
 
 # --- 條紋去除優化參數 (在極座標空間中作用) ---
 STRIPE_REMOVAL_SIGMA = 1
@@ -129,13 +129,13 @@ def reconstruct_and_correct(input_dir, file_pattern, output_file, binning_factor
 
     center_x = reconstructed_volume_with_rings.shape[2] / 2.0
     center_y = reconstructed_volume_with_rings.shape[1] / 2.0
-    max_radius = np.sqrt(center_x ** 2 + center_y ** 2)
+    max_radius = center_x
     original_size = reconstructed_volume_with_rings[0].shape
 
     # 定義超取樣後的大小 (OpenCV 的 dsize 是 (width, height))
     # Theta 方向 (角度, 對應高度) 超取樣 Pi 倍
     # r 方向 (半徑, 對應寬度) 超取樣 Sqrt(2) 倍
-    oversampled_width = int(original_size[1] * np.sqrt(2))  # X-axis is r
+    oversampled_width = int(original_size[1] * 0.5)  # X-axis is r
     oversampled_height = int(original_size[0] * np.pi)  # Y-axis is theta
     oversampled_dsize = (oversampled_width, oversampled_height)
 
@@ -200,6 +200,12 @@ def reconstruct_and_correct(input_dir, file_pattern, output_file, binning_factor
                 # 如果擬合失敗，則保持該行數據不變
                 pass
 
+    try:
+        print("   >> 正在儲存臨時檔：temp_polar_volume_bg_subtracted.tif ...")
+        tifffile.imwrite('temp_polar_volume_bg_subtracted.tif', polar_volume_bg_subtracted)
+    except Exception as e:
+        print(f"   >> 儲存臨時檔失敗: {e}")
+
     # 步驟 3: 對整個極座標體積進行條紋去除
     print("   - 步驟 3/4: 對極座標體積進行條紋去除...")
 
@@ -216,7 +222,7 @@ def reconstruct_and_correct(input_dir, file_pattern, output_file, binning_factor
     # 新增：儲存校正後極座標體積的臨時檔
     try:
         print("   >> 正在儲存臨時檔：temp_corrected_polar_volume.tif ...")
-        tifffile.imwrite('temp_corrected_polar_volume.tif', corrected_polar_volume)
+        #tifffile.imwrite('temp_corrected_polar_volume.tif', corrected_polar_volume)
     except Exception as e:
         print(f"   >> 儲存臨時檔失敗: {e}")
 

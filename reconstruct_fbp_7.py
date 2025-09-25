@@ -12,16 +12,16 @@ import cv2  # 引入 OpenCV 函式庫，用於極座標轉換
 # --- 參數設定 (請根據您的需求修改) ---
 
 # 輸入資料夾：包含 .tiff 投影影像的資料夾路徑
-INPUT_DIR = './TIF_ref2'
+INPUT_DIR = './projections'
 
 # 檔案搜尋模式：用來尋找所有投影影像檔案
 FILE_PATTERN = '*.tif'
 
 # 輸出檔案：重建後的 3D 體積將儲存為一個多頁的 TIFF 檔案
-OUTPUT_FILE = 'NCM811_1.tif'
+OUTPUT_FILE = 'reconstructed_volume_dual_correction_iterative.tif'
 
 # 像素合併因子 (Binning Factor)
-BINNING_FACTOR = 1
+BINNING_FACTOR = 2
 
 # --- 條紋去除優化參數 ---
 # 由於環狀偽影嚴重，我們在重建前後都進行校正
@@ -30,23 +30,22 @@ STRIPE_REMOVAL_WNAME = 'db5'
 
 # *** 新增：迭代次數控制 ***
 # 1. 重建前校正的迭代次數
-PRE_RECON_ITERATIONS = 1
+PRE_RECON_ITERATIONS = 3
 # 2. 重建後校正的迭代次數
-POST_RECON_ITERATIONS = 1
+POST_RECON_ITERATIONS = 3
 
 # *** 新增：批次大小控制 ***
 # 一次處理的切片數量。可根據您的記憶體大小調整 (例如 32, 64, 128)
-# -> 已從 64 降低至 32 以減少記憶體壓力
 PRE_RECON_CHUNK_SIZE = 32
 POST_RECON_CHUNK_SIZE = 32
 
 # 1. 重建前參數 (在正弦圖上作用)
 # 注意：level 設得非常高會大幅增加計算時間與記憶體，建議從 10 開始嘗試
-PRE_RECON_STRIPE_LEVEL = 1
+PRE_RECON_STRIPE_LEVEL = 10
 PRE_RECON_STRIPE_SIGMA = 1
 
 # 2. 重建後參數 (在極座標空間中作用)
-POST_RECON_STRIPE_LEVEL = 1
+POST_RECON_STRIPE_LEVEL = 10
 POST_RECON_STRIPE_SIGMA = 1
 
 
@@ -111,8 +110,7 @@ def reconstruct_and_correct(input_dir, file_pattern, output_file, binning_factor
                 sino_chunk,
                 level=PRE_RECON_STRIPE_LEVEL,
                 sigma=PRE_RECON_STRIPE_SIGMA,
-                wname=STRIPE_REMOVAL_WNAME,
-                ncore=1  # *** 新增：強制單核心運算以避免 Windows 系統資源錯誤 ***
+                wname=STRIPE_REMOVAL_WNAME
             )
         corrected_sinogram_chunks.append(sino_chunk)
 
@@ -182,15 +180,13 @@ def reconstruct_and_correct(input_dir, file_pattern, output_file, binning_factor
                 top_half,
                 sigma=POST_RECON_STRIPE_SIGMA,
                 level=POST_RECON_STRIPE_LEVEL,
-                wname=STRIPE_REMOVAL_WNAME,
-                ncore=1  # *** 新增：強制單核心運算以避免 Windows 系統資源錯誤 ***
+                wname=STRIPE_REMOVAL_WNAME
             )
             bottom_half = tomopy.remove_stripe_fw(
                 bottom_half,
                 sigma=POST_RECON_STRIPE_SIGMA,
                 level=POST_RECON_STRIPE_LEVEL,
-                wname=STRIPE_REMOVAL_WNAME,
-                ncore=1  # *** 新增：強制單核心運算以避免 Windows 系統資源錯誤 ***
+                wname=STRIPE_REMOVAL_WNAME
             )
 
         # 合併校正後的上下兩部分
@@ -232,4 +228,3 @@ if __name__ == '__main__':
     except Exception as e:
         print("\n--- 發生嚴重錯誤 ---")
         print("錯誤訊息:", e)
-
