@@ -8,11 +8,12 @@
 3.  **GPU重建**：使用 ASTRA Toolbox 的 FBP_CUDA 演算法，在GPU上高效地逐一切片重建3D斷層影像。
 4.  **極座標轉換**：將重建後的笛卡爾座標(Cartesian)3D體積轉換為極座標(Polar)。
     -   **目的**：此轉換是為了將影像中的環狀偽影(Ring Artifacts)變為垂直於半徑軸的直線條紋。
-5.  **FFT濾波**：對極座標影像進行FFT(快速傅立葉變換)濾波，以高效去除上一步中產生的垂直條紋。
+5.  **FFT濾波 (GPU加速)**：對極座標影像進行FFT(快速傅立葉變換)濾波，以高效去除上一步中產生的垂直條紋。若偵測到 CuPy，此步驟將在 GPU 運算。
 6.  **反向轉換**：將濾波後的極座標影像反向轉換回笛卡爾座標。
-7.  **3D濾波 (可選)**：
+7.  **3D濾波 (GPU加速)**：
     -   **中值濾波**：對體積進行3D中值濾波，以去除椒鹽雜訊(Salt-and-pepper noise)。
     -   **高斯模糊**：對體積進行3D高斯模糊，以平滑影像並抑制高頻雜訊。
+    -   **若偵測到 CuPy 函式庫，此步驟將自動在 GPU 上執行以大幅提升速度。**
 8.  **智慧儲存**：根據使用者的勾選，僅儲存必要的結果，並自動跳過後續不需要的運算，節省處理時間。
 
 所需函式庫：
@@ -24,7 +25,8 @@
 - astra-toolbox: 高效能的斷層掃描重建工具箱 (GPU加速)。
 - opencv-python (cv2): 用於影像的極座標與笛卡爾座標轉換。
 - scikit-image (skimage): 用於影像降採樣 (Binning)。
-- scipy: 用於3D中值濾波與高斯模糊。
+- cupy (cupyx): (可選，推薦) 用於GPU加速的3D濾波與FFT。
+- scipy: 若無CuPy，則用於CPU上的3D濾波與FFT。
 """
 
 import os
@@ -36,20 +38,35 @@ from tqdm import tqdm
 import astra  # ASTRA Toolbox
 import cv2  # OpenCV 函式庫
 from skimage.transform import downscale_local_mean
-from scipy.ndimage import median_filter, gaussian_filter
 from typing import Optional, Dict, Any
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel, LabelFrame, Frame
+
+# --- 嘗試導入 CuPy 以啟用 GPU 加速 ---
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import median_filter as cupy_median_filter
+    from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter
+    from cupyx.scipy import fft as cupy_fft
+
+    CUPY_AVAILABLE = True
+    print("成功載入 CuPy，將使用 GPU 進行濾波與FFT加速。")
+except ImportError:
+    from scipy.ndimage import median_filter, gaussian_filter
+    from scipy import fft as scipy_fft
+
+    CUPY_AVAILABLE = False
+    print("警告：未找到 CuPy。FFT與濾波將在 CPU 上執行，速度可能較慢。")
 
 # --- 預設組態設定 ---
 # 這些值將作為GUI視窗中顯示的預設值。
 DEFAULT_CONFIG = {
     "FILE_PATTERN": '*.tif',
     "BINNING_FACTOR": 1,
-    "TOLERANCE_VALUE": 2.8,
-    "MEDIAN_FILTER_SIZE": 7,
-    "GAUSSIAN_SIGMA": 2.5,
+    "TOLERANCE_VALUE": 28,
+    "MEDIAN_FILTER_RADIUS": 3,  # 改為半徑，核心大小 = 半徑*2+1
+    "GAUSSIAN_SIGMA": 2,
     "SAVE_RECON_RAW": False,
     "SAVE_POLAR_RAW": False,
     "SAVE_POLAR_FILTERED": False,
@@ -64,7 +81,7 @@ DEFAULT_CONFIG = {
 
 class TomoPipeline:
     """
-    封裝了整個3D斷層掃描重建與後處理的流程。(後端處理邏輯，與GUI無關)
+    封裝了整個3D斷層掃描重建與後處理的流程。(後端處理 logique，與GUI無關)
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -214,24 +231,69 @@ class TomoPipeline:
     def _apply_fft_filter(self) -> bool:
         """使用FFT帶阻濾波器去除極座標體積中的垂直條紋。"""
         tolerance = self.config["TOLERANCE_VALUE"]
-        processed_tolerance = 0.00025 * tolerance
-        self.file_params["tolerance"] = tolerance
+        self.file_params["tolerance"] = int(tolerance)
 
-        if processed_tolerance <= 0: return True
+        if tolerance <= 0: return True
 
-        print(f"開始FFT濾波以去除垂直條紋 (強度: {tolerance})...")
-        filtered_slices = []
-        for polar_slice in tqdm(self.data_volume, desc="FFT濾波進度"):
-            fft_slice = np.fft.fftshift(np.fft.fft2(polar_slice))
-            rows, _ = fft_slice.shape
-            sigma = (rows * processed_tolerance)
-            y_coords = np.arange(rows) - (rows // 2)
-            gaussian_1d = 1.0 - np.exp(-(y_coords ** 2) / (2 * sigma ** 2))
-            fft_slice *= gaussian_1d.reshape(-1, 1)
-            slice_ifft = np.fft.ifft2(np.fft.ifftshift(fft_slice))
-            filtered_slices.append(np.real(slice_ifft))
+        processed_tolerance = 0.000025 * tolerance
 
-        self.data_volume = np.stack(filtered_slices, axis=0).astype(np.float32)
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU FFT濾波以去除垂直條紋 (強度: {int(tolerance)})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                # 預先分配GPU記憶體以儲存結果，避免使用list造成記憶體不足
+                filtered_gpu_volume = cp.empty_like(gpu_volume, dtype=cp.float32)
+
+                rows, _ = gpu_volume[0].shape
+                sigma = (rows * processed_tolerance)
+                y_coords = cp.arange(rows) - (rows // 2)
+                # 在迴圈外計算並重塑高斯濾波器以提高效率
+                gaussian_1d = 1.0 - cp.exp(-(y_coords ** 2) / (2 * sigma ** 2))
+                gaussian_1d = gaussian_1d.reshape(-1, 1)
+
+                for i, polar_slice_gpu in enumerate(tqdm(gpu_volume, desc="GPU FFT濾波進度")):
+                    fft_slice = cupy_fft.fftshift(cupy_fft.fft2(polar_slice_gpu))
+                    fft_slice *= gaussian_1d
+                    slice_ifft = cupy_fft.ifft2(cupy_fft.ifftshift(fft_slice))
+                    # 直接將結果放入預先分配的陣列中
+                    filtered_gpu_volume[i] = cp.real(slice_ifft)
+
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()
+
+            except Exception as e:
+                print(f"GPU FFT濾波失敗: {e}。將改用CPU執行。")
+                # 釋放可能已佔用的GPU記憶體
+                if 'cp' in globals():
+                    cp.get_default_memory_pool().free_all_blocks()
+
+                # --- CPU Fallback Logic ---
+                print(f"開始 CPU FFT濾波以去除垂直條紋 (強度: {int(tolerance)})...")
+                filtered_slices = []
+                for polar_slice in tqdm(self.data_volume, desc="CPU FFT濾波進度"):
+                    fft_slice = np.fft.fftshift(np.fft.fft2(polar_slice))
+                    rows, _ = fft_slice.shape
+                    sigma = (rows * processed_tolerance)
+                    y_coords = np.arange(rows) - (rows // 2)
+                    gaussian_1d = 1.0 - np.exp(-(y_coords ** 2) / (2 * sigma ** 2))
+                    fft_slice *= gaussian_1d.reshape(-1, 1)
+                    slice_ifft = np.fft.ifft2(np.fft.ifftshift(fft_slice))
+                    filtered_slices.append(np.real(slice_ifft))
+                self.data_volume = np.stack(filtered_slices, axis=0).astype(np.float32)
+        else:
+            print(f"開始 CPU FFT濾波以去除垂直條紋 (強度: {int(tolerance)})...")
+            filtered_slices = []
+            for polar_slice in tqdm(self.data_volume, desc="CPU FFT濾波進度"):
+                fft_slice = np.fft.fftshift(np.fft.fft2(polar_slice))
+                rows, _ = fft_slice.shape
+                sigma = (rows * processed_tolerance)
+                y_coords = np.arange(rows) - (rows // 2)
+                gaussian_1d = 1.0 - np.exp(-(y_coords ** 2) / (2 * sigma ** 2))
+                fft_slice *= gaussian_1d.reshape(-1, 1)
+                slice_ifft = np.fft.ifft2(np.fft.ifftshift(fft_slice))
+                filtered_slices.append(np.real(slice_ifft))
+            self.data_volume = np.stack(filtered_slices, axis=0).astype(np.float32)
+
         print("FFT濾波完成。")
         return True
 
@@ -252,31 +314,60 @@ class TomoPipeline:
         return True
 
     def _apply_median_filter(self) -> bool:
-        """對3D體積應用中值濾波器。"""
-        size = self.config["MEDIAN_FILTER_SIZE"]
-        self.file_params["median"] = size
-        if size <= 1: return True
+        """對3D體積應用中值濾波器 (若CuPy可用則使用GPU)。"""
+        radius = self.config["MEDIAN_FILTER_RADIUS"]
+        self.file_params["median"] = radius
+        if radius <= 0:
+            print("中值濾波半徑為0，跳過此步驟。")
+            return True
 
-        # 計算Z軸的核心大小：取XY大小的一半，並確保為最接近的奇數
-        z_size = size // 2
-        if z_size % 2 == 0:  # 如果是偶數
-            z_size += 1  # 加1使其變為奇數
-        z_size = max(1, z_size)  # 確保最小為1
+        z_radius = radius // 2
 
-        filter_shape = (z_size, size, size)
+        xy_kernel = radius * 2 + 1
+        z_kernel = z_radius * 2 + 1
 
-        print(f"開始3D中值濾波 (核心大小: {size}x{size}x{z_size})...")
-        self.data_volume = median_filter(self.data_volume, size=filter_shape)
+        filter_shape = (z_kernel, xy_kernel, xy_kernel)
+
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU 3D中值濾波 (半徑 XYZ: {radius}, {radius}, {z_radius})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cupy_median_filter(gpu_volume, size=filter_shape)
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()  # 釋放GPU記憶體
+            except Exception as e:
+                print(f"GPU中值濾波失敗: {e}。將嘗試使用CPU。")
+                self.data_volume = median_filter(self.data_volume, size=filter_shape)  # Fallback to CPU
+        else:
+            print(f"開始 CPU 3D中值濾波 (半徑 XYZ: {radius}, {radius}, {z_radius})...")
+            self.data_volume = median_filter(self.data_volume, size=filter_shape)
+
         print("3D中值濾波完成。")
         return True
 
     def _apply_gaussian_filter(self) -> bool:
-        """對3D體積應用高斯模糊。"""
+        """對3D體積應用高斯模糊 (若CuPy可用則使用GPU)。"""
         sigma = self.config["GAUSSIAN_SIGMA"]
         self.file_params["gauss"] = sigma
-        if sigma <= 0: return True
-        print(f"開始3D高斯模糊 (Sigma: {sigma})...")
-        self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+        if sigma <= 0:
+            print("高斯模糊標準差為0，跳過此步驟。")
+            return True
+
+        # 此處為高斯模糊的實現，直接使用scipy.ndimage或其GPU版本
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU 3D高斯模糊 (Sigma: {sigma})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cupy_gaussian_filter(gpu_volume, sigma=sigma)
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()  # 釋放GPU記憶體
+            except Exception as e:
+                print(f"GPU高斯模糊失敗: {e}。將嘗試使用CPU。")
+                self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)  # Fallback to CPU
+        else:
+            print(f"開始 CPU 3D高斯模糊 (Sigma: {sigma})...")
+            self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+
         print("3D高斯模糊完成。")
         return True
 
@@ -286,8 +377,10 @@ class TomoPipeline:
         z, y, x = self.data_volume.shape
         param_parts = []
         if "tolerance" in self.file_params: param_parts.append(f"T{self.file_params['tolerance']}")
-        if "median" in self.file_params: param_parts.append(f"M{self.file_params['median']}")
-        if "gauss" in self.file_params: param_parts.append(f"G{self.file_params['gauss']}")
+        if "median" in self.file_params and self.file_params['median'] > 0: param_parts.append(
+            f"M{self.file_params['median']}")
+        if "gauss" in self.file_params and self.file_params['gauss'] > 0: param_parts.append(
+            f"G{self.file_params['gauss']:.1f}".replace('.0', ''))
         param_parts.append(f"B{self.file_params['binning']}")
         param_parts.append(f"{x}x{y}x{z}")
 
@@ -297,7 +390,7 @@ class TomoPipeline:
 
         print(f"正在將 {volume_type} 體積儲存至 '{output_path}'...")
         try:
-            tifffile.imwrite(output_path, self.data_volume)
+            tifffile.imwrite(output_path, self.data_volume.astype(np.float32))
             print(f"-> 檔案已成功儲存。")
         except Exception as e:
             print(f"錯誤：儲存檔案 '{output_path}' 失敗。詳細資訊: {e}")
@@ -332,7 +425,7 @@ class App(tk.Tk):
 
         param_defs = {
             "BINNING_FACTOR": "像素合併因子 (Binning):", "TOLERANCE_VALUE": "FFT 濾波強度 (Tolerance):",
-            "MEDIAN_FILTER_SIZE": "中值濾波核心大小 (Median):", "GAUSSIAN_SIGMA": "高斯模糊標準差 (Gauss):"
+            "MEDIAN_FILTER_RADIUS": "中值濾波半徑 (Median Radius):", "GAUSSIAN_SIGMA": "高斯模糊標準差 (Gauss):"
         }
         for i, (key, label) in enumerate(param_defs.items()):
             tk.Label(param_frame, text=label).grid(row=i, column=0, padx=5, pady=3, sticky='w')
@@ -390,15 +483,10 @@ class App(tk.Tk):
 
         try:
             # 獲取並驗證參數
-            median_size = int(self.entries["MEDIAN_FILTER_SIZE"].get())
-            if median_size % 2 == 0 and median_size > 1:
-                median_size += 1
-                print(f"提示：中值濾波核心大小已自動調整為奇數 {median_size}")
-
             user_params = {
                 "BINNING_FACTOR": int(self.entries["BINNING_FACTOR"].get()),
                 "TOLERANCE_VALUE": float(self.entries["TOLERANCE_VALUE"].get()),
-                "MEDIAN_FILTER_SIZE": median_size,
+                "MEDIAN_FILTER_RADIUS": int(self.entries["MEDIAN_FILTER_RADIUS"].get()),
                 "GAUSSIAN_SIGMA": float(self.entries["GAUSSIAN_SIGMA"].get()),
             }
             for key, var in self.save_vars.items():
@@ -450,4 +538,8 @@ if __name__ == '__main__':
         import traceback
 
         traceback.print_exc()
+        # In a GUI app, it's better to show a dialog
+        root = tk.Tk()
+        root.withdraw()  # hide the main window
+        messagebox.showerror("嚴重錯誤", f"發生未預期的錯誤，程式即將關閉。\n\n詳細資訊:\n{e}")
 

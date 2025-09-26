@@ -10,9 +10,10 @@
     -   **目的**：此轉換是為了將影像中的環狀偽影(Ring Artifacts)變為垂直於半徑軸的直線條紋。
 5.  **FFT濾波**：對極座標影像進行FFT(快速傅立葉變換)濾波，以高效去除上一步中產生的垂直條紋。
 6.  **反向轉換**：將濾波後的極座標影像反向轉換回笛卡爾座標。
-7.  **3D濾波 (可選)**：
+7.  **3D濾波 (GPU加速)**：
     -   **中值濾波**：對體積進行3D中值濾波，以去除椒鹽雜訊(Salt-and-pepper noise)。
     -   **高斯模糊**：對體積進行3D高斯模糊，以平滑影像並抑制高頻雜訊。
+    -   **若偵測到 CuPy 函式庫，此步驟將自動在 GPU 上執行以大幅提升速度。**
 8.  **智慧儲存**：根據使用者的勾選，僅儲存必要的結果，並自動跳過後續不需要的運算，節省處理時間。
 
 所需函式庫：
@@ -24,7 +25,8 @@
 - astra-toolbox: 高效能的斷層掃描重建工具箱 (GPU加速)。
 - opencv-python (cv2): 用於影像的極座標與笛卡爾座標轉換。
 - scikit-image (skimage): 用於影像降採樣 (Binning)。
-- scipy: 用於3D中值濾波與高斯模糊。
+- cupy (cupyx): (可選，推薦) 用於GPU加速的3D濾波。
+- scipy: 若無CuPy，則用於CPU上的3D濾波。
 """
 
 import os
@@ -36,18 +38,31 @@ from tqdm import tqdm
 import astra  # ASTRA Toolbox
 import cv2  # OpenCV 函式庫
 from skimage.transform import downscale_local_mean
-from scipy.ndimage import median_filter, gaussian_filter
 from typing import Optional, Dict, Any
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel, LabelFrame, Frame
+
+# --- 嘗試導入 CuPy 以啟用 GPU 濾波 ---
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import median_filter as cupy_median_filter
+    from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter
+
+    CUPY_AVAILABLE = True
+    print("成功載入 CuPy，將使用 GPU 進行濾波加速。")
+except ImportError:
+    from scipy.ndimage import median_filter, gaussian_filter
+
+    CUPY_AVAILABLE = False
+    print("警告：未找到 CuPy。濾波將在 CPU 上執行，速度可能較慢。")
 
 # --- 預設組態設定 ---
 # 這些值將作為GUI視窗中顯示的預設值。
 DEFAULT_CONFIG = {
     "FILE_PATTERN": '*.tif',
     "BINNING_FACTOR": 1,
-    "TOLERANCE_VALUE": 2.8,
+    "TOLERANCE_VALUE": 28,
     "MEDIAN_FILTER_SIZE": 7,
     "GAUSSIAN_SIGMA": 2.5,
     "SAVE_RECON_RAW": False,
@@ -214,7 +229,7 @@ class TomoPipeline:
     def _apply_fft_filter(self) -> bool:
         """使用FFT帶阻濾波器去除極座標體積中的垂直條紋。"""
         tolerance = self.config["TOLERANCE_VALUE"]
-        processed_tolerance = 0.00025 * tolerance
+        processed_tolerance = 0.000025 * tolerance
         self.file_params["tolerance"] = tolerance
 
         if processed_tolerance <= 0: return True
@@ -252,7 +267,7 @@ class TomoPipeline:
         return True
 
     def _apply_median_filter(self) -> bool:
-        """對3D體積應用中值濾波器。"""
+        """對3D體積應用中值濾波器 (若CuPy可用則使用GPU)。"""
         size = self.config["MEDIAN_FILTER_SIZE"]
         self.file_params["median"] = size
         if size <= 1: return True
@@ -262,21 +277,45 @@ class TomoPipeline:
         if z_size % 2 == 0:  # 如果是偶數
             z_size += 1  # 加1使其變為奇數
         z_size = max(1, z_size)  # 確保最小為1
-
         filter_shape = (z_size, size, size)
 
-        print(f"開始3D中值濾波 (核心大小: {size}x{size}x{z_size})...")
-        self.data_volume = median_filter(self.data_volume, size=filter_shape)
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU 3D中值濾波 (核心大小: {filter_shape})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cupy_median_filter(gpu_volume, size=filter_shape)
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()  # 釋放GPU記憶體
+            except Exception as e:
+                print(f"GPU中值濾波失敗: {e}。將嘗試使用CPU。")
+                self.data_volume = median_filter(self.data_volume, size=filter_shape)  # Fallback to CPU
+        else:
+            print(f"開始 CPU 3D中值濾波 (核心大小: {filter_shape})...")
+            self.data_volume = median_filter(self.data_volume, size=filter_shape)
+
         print("3D中值濾波完成。")
         return True
 
     def _apply_gaussian_filter(self) -> bool:
-        """對3D體積應用高斯模糊。"""
+        """對3D體積應用高斯模糊 (若CuPy可用則使用GPU)。"""
         sigma = self.config["GAUSSIAN_SIGMA"]
         self.file_params["gauss"] = sigma
         if sigma <= 0: return True
-        print(f"開始3D高斯模糊 (Sigma: {sigma})...")
-        self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU 3D高斯模糊 (Sigma: {sigma})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cupy_gaussian_filter(gpu_volume, sigma=sigma)
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()  # 釋放GPU記憶體
+            except Exception as e:
+                print(f"GPU高斯模糊失敗: {e}。將嘗試使用CPU。")
+                self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)  # Fallback to CPU
+        else:
+            print(f"開始 CPU 3D高斯模糊 (Sigma: {sigma})...")
+            self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+
         print("3D高斯模糊完成。")
         return True
 
@@ -450,4 +489,3 @@ if __name__ == '__main__':
         import traceback
 
         traceback.print_exc()
-

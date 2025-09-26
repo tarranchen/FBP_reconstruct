@@ -8,11 +8,12 @@
 3.  **GPU重建**：使用 ASTRA Toolbox 的 FBP_CUDA 演算法，在GPU上高效地逐一切片重建3D斷層影像。
 4.  **極座標轉換**：將重建後的笛卡爾座標(Cartesian)3D體積轉換為極座標(Polar)。
     -   **目的**：此轉換是為了將影像中的環狀偽影(Ring Artifacts)變為垂直於半徑軸的直線條紋。
-5.  **FFT濾波**：對極座標影像進行FFT(快速傅立葉變換)濾波，以高效去除上一步中產生的垂直條紋。
+5.  **FFT濾波 (GPU加速)**：對極座標影像進行FFT(快速傅立葉變換)濾波，以高效去除上一步中產生的垂直條紋。若偵測到 CuPy，此步驟將在 GPU 運算。
 6.  **反向轉換**：將濾波後的極座標影像反向轉換回笛卡爾座標。
-7.  **3D濾波 (可選)**：
+7.  **3D濾波 (GPU加速)**：
     -   **中值濾波**：對體積進行3D中值濾波，以去除椒鹽雜訊(Salt-and-pepper noise)。
     -   **高斯模糊**：對體積進行3D高斯模糊，以平滑影像並抑制高頻雜訊。
+    -   **若偵測到 CuPy 函式庫，此步驟將自動在 GPU 上執行以大幅提升速度。**
 8.  **智慧儲存**：根據使用者的勾選，僅儲存必要的結果，並自動跳過後續不需要的運算，節省處理時間。
 
 所需函式庫：
@@ -20,36 +21,52 @@
 - os, glob: 檔案與路徑處理。
 - numpy: 高效的數值與陣列運算。
 - tifffile: 讀取與寫入 TIF 格式影像。
-- tqdm: 提供美觀的進度條，方便監控處理進度。
 - astra-toolbox: 高效能的斷層掃描重建工具箱 (GPU加速)。
 - opencv-python (cv2): 用於影像的極座標與笛卡爾座標轉換。
 - scikit-image (skimage): 用於影像降採樣 (Binning)。
-- scipy: 用於3D中值濾波與高斯模糊。
+- cupy (cupyx): (可選，推薦) 用於GPU加速的3D濾波與FFT。
+- scipy: 若無CuPy，則用於CPU上的3D濾波與FFT。
 """
 
 import os
 import sys
 import glob
+import time
 import numpy as np
 import tifffile
-from tqdm import tqdm
 import astra  # ASTRA Toolbox
 import cv2  # OpenCV 函式庫
 from skimage.transform import downscale_local_mean
-from scipy.ndimage import median_filter, gaussian_filter
 from typing import Optional, Dict, Any
+import threading
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, Toplevel, LabelFrame, Frame
+from tkinter import filedialog, messagebox, Toplevel, LabelFrame, Frame, scrolledtext
+
+# --- 嘗試導入 CuPy 以啟用 GPU 加速 ---
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import median_filter as cupy_median_filter
+    from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter
+    from cupyx.scipy import fft as cupy_fft
+
+    CUPY_AVAILABLE = True
+    print("成功載入 CuPy，將使用 GPU 進行濾波與FFT加速。")
+except ImportError:
+    from scipy.ndimage import median_filter, gaussian_filter
+    from scipy import fft as scipy_fft
+
+    CUPY_AVAILABLE = False
+    print("警告：未找到 CuPy。FFT與濾波將在 CPU 上執行，速度可能較慢。")
 
 # --- 預設組態設定 ---
 # 這些值將作為GUI視窗中顯示的預設值。
 DEFAULT_CONFIG = {
     "FILE_PATTERN": '*.tif',
     "BINNING_FACTOR": 1,
-    "TOLERANCE_VALUE": 2.8,
-    "MEDIAN_FILTER_SIZE": 7,
-    "GAUSSIAN_SIGMA": 2.5,
+    "TOLERANCE_VALUE": 28,
+    "MEDIAN_FILTER_RADIUS": 3,  # 改為半徑，核心大小 = 半徑*2+1
+    "GAUSSIAN_SIGMA": 1.6,
     "SAVE_RECON_RAW": False,
     "SAVE_POLAR_RAW": False,
     "SAVE_POLAR_FILTERED": False,
@@ -60,6 +77,26 @@ DEFAULT_CONFIG = {
 
 
 # -----------------------------------------
+
+class TextRedirector:
+    """一個將 print 輸出重新導向到 Tkinter Text Widget 的類別。"""
+
+    def __init__(self, widget):
+        self.widget = widget
+
+    def write(self, text):
+        # 使用 after_idle 確保 GUI 更新是執行緒安全的
+        def _write():
+            self.widget.configure(state='normal')
+            self.widget.insert(tk.END, text)
+            self.widget.see(tk.END)  # 自動捲動到最底部
+            self.widget.configure(state='disabled')
+
+        self.widget.after_idle(_write)
+
+    def flush(self):
+        # Text widget 會自動更新，所以 flush 不需要做任何事
+        pass
 
 
 class TomoPipeline:
@@ -75,6 +112,7 @@ class TomoPipeline:
         self.input_dir: str = ""
         self.base_name: str = ""
         self.file_params: Dict[str, Any] = {}
+        self.step_timings: Dict[str, float] = {}
 
         self.processing_steps = [
             {"name": "load_projections", "method": self._load_projections},
@@ -96,6 +134,8 @@ class TomoPipeline:
         print("--- 開始 3D 重建與後處理任務 ---\n")
         self.base_name = os.path.basename(self.input_dir)
         self.file_params = {"binning": self.config["BINNING_FACTOR"]}
+        self.step_timings.clear()
+        total_start_time = time.time()
 
         last_step_to_run = None
         for step in reversed(self.processing_steps):
@@ -109,7 +149,11 @@ class TomoPipeline:
 
         for step in self.processing_steps:
             print(f"\n--- 步驟：{step['name']} ---")
+            step_start_time = time.time()
             success = step["method"]()
+            step_end_time = time.time()
+            self.step_timings[step['name']] = step_end_time - step_start_time
+
             if not success:
                 print(f"錯誤：步驟 {step['name']} 執行失敗，流程中止。")
                 return False
@@ -122,7 +166,17 @@ class TomoPipeline:
                 print("\n已完成所有指定步驟，處理流程結束。")
                 break
 
+        total_end_time = time.time()
+        self.step_timings["Total Processing Time"] = total_end_time - total_start_time
+        self._print_timing_summary()
         return True
+
+    def _print_timing_summary(self):
+        """印出每個步驟的耗時摘要。"""
+        print("\n\n--- 處理時間摘要 ---")
+        for name, duration in self.step_timings.items():
+            print(f"{name:<35}: {duration:>7.2f} 秒")
+        print("---------------------------------------------")
 
     def _load_projections(self) -> bool:
         """從指定資料夾讀取、合併並預處理投影影像。"""
@@ -151,12 +205,18 @@ class TomoPipeline:
         print(f"原始影像維度: {first_image.shape} -> 合併後維度: {binned_shape}")
 
         self.projections = np.zeros((num_files, binned_height, binned_width), dtype=np.float32)
-        for i, file_path in enumerate(tqdm(file_list, desc="讀取與合併進度")):
+
+        # 手動更新進度以避免GUI過度刷新
+        update_interval = max(1, num_files // 10)  # 每10%更新一次
+        for i, file_path in enumerate(file_list):
             image = tifffile.imread(file_path).astype(np.float32)
             if bin_factor > 1:
                 self.projections[i, :, :] = downscale_local_mean(image, (bin_factor, bin_factor))
             else:
                 self.projections[i, :, :] = image
+
+            if (i + 1) % update_interval == 0 or (i + 1) == num_files:
+                print(f"  > 讀取與合併進度: {i + 1} / {num_files} ({(i + 1) / num_files:.0%})")
 
         return True
 
@@ -169,7 +229,8 @@ class TomoPipeline:
         vol_geom = astra.create_vol_geom(width, width)
         proj_geom = astra.create_proj_geom('parallel', 1.0, width, self.angles_rad)
 
-        for y in tqdm(range(height), desc="GPU 重建進度"):
+        update_interval = max(1, height // 10)
+        for y in range(height):
             sinogram_slice = self.projections[:, y, :]
             sino_id = astra.data2d.create('-sino', proj_geom, sinogram_slice)
             reco_id = astra.data2d.create('-vol', vol_geom)
@@ -187,6 +248,9 @@ class TomoPipeline:
             astra.data2d.delete(reco_id)
             astra.data2d.delete(sino_id)
 
+            if (y + 1) % update_interval == 0 or (y + 1) == height:
+                print(f"  > GPU 重建進度: {y + 1} / {height} ({(y + 1) / height:.0%})")
+
         self.data_volume = np.stack(reconstructed_slices, axis=0).astype(np.float32)
         print("GPU 重建完成。")
         return True
@@ -194,7 +258,7 @@ class TomoPipeline:
     def _convert_to_polar(self) -> bool:
         """將笛卡爾座標系的3D體積逐切片轉換為極座標系。"""
         print("將體積轉換為極座標以處理環狀偽影...")
-        _, y_dim, x_dim = self.data_volume.shape
+        num_slices, y_dim, x_dim = self.data_volume.shape
         center = (x_dim / 2.0, y_dim / 2.0)
         max_radius = x_dim / 2.0
 
@@ -203,10 +267,13 @@ class TomoPipeline:
         if oversampled_height % 2 != 0: oversampled_height += 1
         dsize = (oversampled_width, oversampled_height)
 
-        polar_slices = [
-            cv2.warpPolar(s, dsize, center, max_radius, cv2.INTER_LINEAR + cv2.WARP_FILL_OUTLIERS)
-            for s in tqdm(self.data_volume, desc="極座標轉換進度")
-        ]
+        polar_slices = []
+        update_interval = max(1, num_slices // 10)
+        for i, s in enumerate(self.data_volume):
+            polar_slices.append(cv2.warpPolar(s, dsize, center, max_radius, cv2.INTER_LINEAR + cv2.WARP_FILL_OUTLIERS))
+            if (i + 1) % update_interval == 0 or (i + 1) == num_slices:
+                print(f"  > 極座標轉換進度: {i + 1} / {num_slices} ({(i + 1) / num_slices:.0%})")
+
         self.data_volume = np.stack(polar_slices, axis=0).astype(np.float32)
         print("極座標轉換完成。")
         return True
@@ -214,24 +281,60 @@ class TomoPipeline:
     def _apply_fft_filter(self) -> bool:
         """使用FFT帶阻濾波器去除極座標體積中的垂直條紋。"""
         tolerance = self.config["TOLERANCE_VALUE"]
-        processed_tolerance = 0.00025 * tolerance
-        self.file_params["tolerance"] = tolerance
+        self.file_params["tolerance"] = int(tolerance)
 
-        if processed_tolerance <= 0: return True
+        if tolerance <= 0: return True
 
-        print(f"開始FFT濾波以去除垂直條紋 (強度: {tolerance})...")
-        filtered_slices = []
-        for polar_slice in tqdm(self.data_volume, desc="FFT濾波進度"):
-            fft_slice = np.fft.fftshift(np.fft.fft2(polar_slice))
-            rows, _ = fft_slice.shape
-            sigma = (rows * processed_tolerance)
-            y_coords = np.arange(rows) - (rows // 2)
-            gaussian_1d = 1.0 - np.exp(-(y_coords ** 2) / (2 * sigma ** 2))
-            fft_slice *= gaussian_1d.reshape(-1, 1)
-            slice_ifft = np.fft.ifft2(np.fft.ifftshift(fft_slice))
-            filtered_slices.append(np.real(slice_ifft))
+        processed_tolerance = 0.000025 * tolerance
+        num_slices = self.data_volume.shape[0]
+        update_interval = max(1, num_slices // 10)
 
-        self.data_volume = np.stack(filtered_slices, axis=0).astype(np.float32)
+        use_cpu_fallback = False
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU FFT濾波以去除垂直條紋 (強度: {int(tolerance)})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cp.empty_like(gpu_volume, dtype=cp.float32)
+
+                rows, _ = gpu_volume[0].shape
+                sigma = (rows * processed_tolerance)
+                y_coords = cp.arange(rows) - (rows // 2)
+                gaussian_1d = 1.0 - cp.exp(-(y_coords ** 2) / (2 * sigma ** 2))
+                gaussian_1d = gaussian_1d.reshape(-1, 1)
+
+                for i, polar_slice_gpu in enumerate(gpu_volume):
+                    fft_slice = cupy_fft.fftshift(cupy_fft.fft2(polar_slice_gpu))
+                    fft_slice *= gaussian_1d
+                    slice_ifft = cupy_fft.ifft2(cupy_fft.ifftshift(fft_slice))
+                    filtered_gpu_volume[i] = cp.real(slice_ifft)
+                    if (i + 1) % update_interval == 0 or (i + 1) == num_slices:
+                        print(f"  > GPU FFT濾波進度: {i + 1} / {num_slices} ({(i + 1) / num_slices:.0%})")
+
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()
+
+            except Exception as e:
+                print(f"GPU FFT濾波失敗: {e}。將改用CPU執行。")
+                if 'cp' in globals():
+                    cp.get_default_memory_pool().free_all_blocks()
+                use_cpu_fallback = True
+
+        if not CUPY_AVAILABLE or use_cpu_fallback:
+            print(f"開始 CPU FFT濾波以去除垂直條紋 (強度: {int(tolerance)})...")
+            filtered_slices = []
+            for i, polar_slice in enumerate(self.data_volume):
+                fft_slice = np.fft.fftshift(np.fft.fft2(polar_slice))
+                rows, _ = fft_slice.shape
+                sigma = (rows * processed_tolerance)
+                y_coords = np.arange(rows) - (rows // 2)
+                gaussian_1d = 1.0 - np.exp(-(y_coords ** 2) / (2 * sigma ** 2))
+                fft_slice *= gaussian_1d.reshape(-1, 1)
+                slice_ifft = np.fft.ifft2(np.fft.ifftshift(fft_slice))
+                filtered_slices.append(np.real(slice_ifft))
+                if (i + 1) % update_interval == 0 or (i + 1) == num_slices:
+                    print(f"  > CPU FFT濾波進度: {i + 1} / {num_slices} ({(i + 1) / num_slices:.0%})")
+            self.data_volume = np.stack(filtered_slices, axis=0).astype(np.float32)
+
         print("FFT濾波完成。")
         return True
 
@@ -239,44 +342,77 @@ class TomoPipeline:
         """將極座標系的3D體積反向轉換回笛卡爾座標系。"""
         print("將濾波後的極座標體積轉回笛卡爾座標...")
         _, height, width = self.projections.shape
+        num_slices = self.data_volume.shape[0]
         center = (width / 2.0, height / 2.0)
         max_radius = width / 2.0
         dsize = (width, height)
 
-        cartesian_slices = [
-            cv2.warpPolar(s, dsize, center, max_radius, cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
-            for s in tqdm(self.data_volume, desc="反向極座標轉換進度")
-        ]
+        cartesian_slices = []
+        update_interval = max(1, num_slices // 10)
+        for i, s in enumerate(self.data_volume):
+            cartesian_slices.append(
+                cv2.warpPolar(s, dsize, center, max_radius, cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP))
+            if (i + 1) % update_interval == 0 or (i + 1) == num_slices:
+                print(f"  > 反向極座標轉換進度: {i + 1} / {num_slices} ({(i + 1) / num_slices:.0%})")
+
         self.data_volume = np.stack(cartesian_slices, axis=0).astype(np.float32)
         print("反向轉換完成。")
         return True
 
     def _apply_median_filter(self) -> bool:
-        """對3D體積應用中值濾波器。"""
-        size = self.config["MEDIAN_FILTER_SIZE"]
-        self.file_params["median"] = size
-        if size <= 1: return True
+        """對3D體積應用中值濾波器 (若CuPy可用則使用GPU)。"""
+        radius = self.config["MEDIAN_FILTER_RADIUS"]
+        self.file_params["median"] = radius
+        if radius <= 0:
+            print("中值濾波半徑為0，跳過此步驟。")
+            return True
 
-        # 計算Z軸的核心大小：取XY大小的一半，並確保為最接近的奇數
-        z_size = size // 2
-        if z_size % 2 == 0:  # 如果是偶數
-            z_size += 1  # 加1使其變為奇數
-        z_size = max(1, z_size)  # 確保最小為1
+        z_radius = radius // 2
 
-        filter_shape = (z_size, size, size)
+        xy_kernel = radius * 2 + 1
+        z_kernel = z_radius * 2 + 1
 
-        print(f"開始3D中值濾波 (核心大小: {size}x{size}x{z_size})...")
-        self.data_volume = median_filter(self.data_volume, size=filter_shape)
+        filter_shape = (z_kernel, xy_kernel, xy_kernel)
+
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU 3D中值濾波 (半徑 XYZ: {radius}, {radius}, {z_radius})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cupy_median_filter(gpu_volume, size=filter_shape)
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception as e:
+                print(f"GPU中值濾波失敗: {e}。將嘗試使用CPU。")
+                self.data_volume = median_filter(self.data_volume, size=filter_shape)
+        else:
+            print(f"開始 CPU 3D中值濾波 (半徑 XYZ: {radius}, {radius}, {z_radius})...")
+            self.data_volume = median_filter(self.data_volume, size=filter_shape)
+
         print("3D中值濾波完成。")
         return True
 
     def _apply_gaussian_filter(self) -> bool:
-        """對3D體積應用高斯模糊。"""
+        """對3D體積應用高斯模糊 (若CuPy可用則使用GPU)。"""
         sigma = self.config["GAUSSIAN_SIGMA"]
         self.file_params["gauss"] = sigma
-        if sigma <= 0: return True
-        print(f"開始3D高斯模糊 (Sigma: {sigma})...")
-        self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+        if sigma <= 0:
+            print("高斯模糊標準差為0，跳過此步驟。")
+            return True
+
+        if CUPY_AVAILABLE:
+            print(f"開始 GPU 3D高斯模糊 (Sigma: {sigma})...")
+            try:
+                gpu_volume = cp.asarray(self.data_volume)
+                filtered_gpu_volume = cupy_gaussian_filter(gpu_volume, sigma=sigma)
+                self.data_volume = cp.asnumpy(filtered_gpu_volume)
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception as e:
+                print(f"GPU高斯模糊失敗: {e}。將嘗試使用CPU。")
+                self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+        else:
+            print(f"開始 CPU 3D高斯模糊 (Sigma: {sigma})...")
+            self.data_volume = gaussian_filter(self.data_volume, sigma=sigma)
+
         print("3D高斯模糊完成。")
         return True
 
@@ -286,8 +422,10 @@ class TomoPipeline:
         z, y, x = self.data_volume.shape
         param_parts = []
         if "tolerance" in self.file_params: param_parts.append(f"T{self.file_params['tolerance']}")
-        if "median" in self.file_params: param_parts.append(f"M{self.file_params['median']}")
-        if "gauss" in self.file_params: param_parts.append(f"G{self.file_params['gauss']}")
+        if "median" in self.file_params and self.file_params['median'] > 0: param_parts.append(
+            f"M{self.file_params['median']}")
+        if "gauss" in self.file_params and self.file_params['gauss'] > 0: param_parts.append(
+            f"G{self.file_params['gauss']:.1f}".replace('.0', ''))
         param_parts.append(f"B{self.file_params['binning']}")
         param_parts.append(f"{x}x{y}x{z}")
 
@@ -297,7 +435,7 @@ class TomoPipeline:
 
         print(f"正在將 {volume_type} 體積儲存至 '{output_path}'...")
         try:
-            tifffile.imwrite(output_path, self.data_volume)
+            tifffile.imwrite(output_path, self.data_volume.astype(np.float32))
             print(f"-> 檔案已成功儲存。")
         except Exception as e:
             print(f"錯誤：儲存檔案 '{output_path}' 失敗。詳細資訊: {e}")
@@ -313,26 +451,35 @@ class App(tk.Tk):
         self.defaults = defaults
 
         self.title("3D斷層掃描重建工具")
-        self.resizable(False, False)
+        self.resizable(True, True)  # 允許調整視窗大小
 
         self.entries: Dict[str, tk.StringVar] = {}
         self.save_vars: Dict[str, tk.BooleanVar] = {}
         self.folder_path = tk.StringVar()
 
         self._create_widgets()
+
+        # 將 stdout 和 stderr 重新導向到 GUI 中的 log widget
+        # 這必須在 widget 建立之後執行
+        sys.stdout = TextRedirector(self.log_text)
+        sys.stderr = TextRedirector(self.log_text)
+
         self._center_window()
 
     def _create_widgets(self):
         main_frame = Frame(self, padx=10, pady=10)
         main_frame.pack(fill="both", expand=True)
+        # 設定網格權重，讓 log_frame 可以垂直擴展
+        main_frame.rowconfigure(3, weight=1)
+        main_frame.columnconfigure(0, weight=1)
 
         # --- 參數輸入區 ---
         param_frame = LabelFrame(main_frame, text="濾波器參數", padx=10, pady=10)
-        param_frame.pack(padx=10, pady=5, fill="x")
+        param_frame.grid(row=0, column=0, padx=10, pady=5, sticky='ew')
 
         param_defs = {
             "BINNING_FACTOR": "像素合併因子 (Binning):", "TOLERANCE_VALUE": "FFT 濾波強度 (Tolerance):",
-            "MEDIAN_FILTER_SIZE": "中值濾波核心大小 (Median):", "GAUSSIAN_SIGMA": "高斯模糊標準差 (Gauss):"
+            "MEDIAN_FILTER_RADIUS": "中值濾波半徑 (Median Radius):", "GAUSSIAN_SIGMA": "高斯模糊標準差 (Gauss):"
         }
         for i, (key, label) in enumerate(param_defs.items()):
             tk.Label(param_frame, text=label).grid(row=i, column=0, padx=5, pady=3, sticky='w')
@@ -343,7 +490,7 @@ class App(tk.Tk):
 
         # --- 存檔選項區 ---
         save_frame = LabelFrame(main_frame, text="選擇要輸出的檔案 (流程將執行至最後一個勾選項)", padx=10, pady=10)
-        save_frame.pack(padx=10, pady=5, fill="x")
+        save_frame.grid(row=1, column=0, padx=10, pady=5, sticky='ew')
 
         save_defs = {
             "SAVE_RECON_RAW": "1. 原始重建檔案 (RECON)", "SAVE_POLAR_RAW": "2. 原始極座標檔案 (POLAR)",
@@ -359,7 +506,7 @@ class App(tk.Tk):
 
         # --- 執行控制區 ---
         run_frame = LabelFrame(main_frame, text="執行控制", padx=10, pady=10)
-        run_frame.pack(padx=10, pady=5, fill="x")
+        run_frame.grid(row=2, column=0, padx=10, pady=5, sticky='ew')
 
         # 資料夾選擇
         folder_select_frame = Frame(run_frame)
@@ -373,32 +520,37 @@ class App(tk.Tk):
         # 主按鈕
         button_frame = Frame(run_frame)
         button_frame.pack(fill='x', pady=10)
-        self.start_button = tk.Button(button_frame, text="開始重建", width=12, command=self._start_processing)
+        self.start_button = tk.Button(button_frame, text="開始重建", width=12, command=self._start_processing_thread)
         self.start_button.pack(side="left", padx=10)
         tk.Button(button_frame, text="離開", width=12, command=self.destroy).pack(side="right", padx=10)
+
+        # --- Log 輸出區 ---
+        log_frame = LabelFrame(main_frame, text="執行日誌", padx=10, pady=10)
+        log_frame.grid(row=3, column=0, padx=10, pady=5, sticky='nsew')
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, state='disabled', height=15, wrap=tk.WORD)
+        self.log_text.grid(row=0, column=0, sticky='nsew')
 
     def _select_folder(self):
         path = filedialog.askdirectory(parent=self, title="請選擇包含投影影像的資料夾")
         if path:
             self.folder_path.set(path)
 
-    def _start_processing(self):
+    def _start_processing_thread(self):
+        """啟動一個背景執行緒來處理數據，避免GUI凍結。"""
+        # 檢查參數和路徑
         input_dir = self.folder_path.get()
         if not os.path.isdir(input_dir):
             messagebox.showerror("錯誤", "請先選擇一個有效的資料夾。", parent=self)
             return
 
         try:
-            # 獲取並驗證參數
-            median_size = int(self.entries["MEDIAN_FILTER_SIZE"].get())
-            if median_size % 2 == 0 and median_size > 1:
-                median_size += 1
-                print(f"提示：中值濾波核心大小已自動調整為奇數 {median_size}")
-
             user_params = {
                 "BINNING_FACTOR": int(self.entries["BINNING_FACTOR"].get()),
                 "TOLERANCE_VALUE": float(self.entries["TOLERANCE_VALUE"].get()),
-                "MEDIAN_FILTER_SIZE": median_size,
+                "MEDIAN_FILTER_RADIUS": int(self.entries["MEDIAN_FILTER_RADIUS"].get()),
                 "GAUSSIAN_SIGMA": float(self.entries["GAUSSIAN_SIGMA"].get()),
             }
             for key, var in self.save_vars.items():
@@ -407,38 +559,56 @@ class App(tk.Tk):
             messagebox.showerror("輸入錯誤", "請確保所有參數均為有效的數字。", parent=self)
             return
 
-        # 禁用按鈕，防止重複點擊
+        # 禁用按鈕並準備配置
         self.start_button.config(state="disabled")
-        self.update_idletasks()  # 立即更新UI
-
-        # 執行後端處理
         config = self.defaults.copy()
         config.update(user_params)
 
+        # 建立並啟動執行緒
+        thread = threading.Thread(target=self._run_pipeline, args=(config, input_dir))
+        thread.daemon = True  # 設置為守護執行緒，這樣主視窗關閉時它會自動退出
+        thread.start()
+
+    def _run_pipeline(self, config, input_dir):
+        """此函式在背景執行緒中運行，執行主要的處理流程。"""
         pipeline = TomoPipeline(config)
         success = pipeline.run(input_dir)
 
-        # 顯示結果
+        # 處理完成後，使用 after_idle 將 GUI 更新操作交回主執行緒
+        self.after_idle(self._on_processing_complete, success)
+
+    def _on_processing_complete(self, success):
+        """此函式在主執行緒中運行，用於顯示最終訊息並重新啟用按鈕。"""
         if success:
             messagebox.showinfo("成功", "任務成功！\n3D 重建與後處理任務已成功完成。", parent=self)
         else:
-            messagebox.showerror("錯誤", "任務失敗！\n處理過程中發生錯誤，請查看終端機輸出以獲取詳細資訊。", parent=self)
+            messagebox.showerror("錯誤", "任務失敗！\n處理過程中發生錯誤，請查看日誌視窗以獲取詳細資訊。", parent=self)
 
-        # 重新啟用按鈕
         self.start_button.config(state="normal")
 
     def _center_window(self):
         self.update_idletasks()
-        width = self.winfo_width()
-        height = self.winfo_height()
-        x = (self.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.winfo_screenheight() // 2) - (height // 2)
-        self.geometry(f'{width}x{height}+{x}+{y}')
+        # 設定一個最小啟動視窗大小
+        min_width = 550
+        min_height = 750
+        self.minsize(min_width, min_height)
+
+        # 計算置中位置
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = (screen_width // 2) - (min_width // 2)
+        y = (screen_height // 2) - (min_height // 2)
+
+        self.geometry(f'{min_width}x{min_height}+{x}+{y}')
 
 
 def main():
     """主執行函式，啟動GUI應用程式。"""
     app = App(DEFAULT_CONFIG)
+    # 初始的 print 訊息現在會被導向到 GUI
+    print("3D斷層掃描重建工具已啟動。")
+    if not CUPY_AVAILABLE:
+        print("提示：若要啟用GPU加速，請安裝 CuPy 函式庫。")
     app.mainloop()
 
 
@@ -450,4 +620,7 @@ if __name__ == '__main__':
         import traceback
 
         traceback.print_exc()
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("嚴重錯誤", f"發生未預期的錯誤，程式即將關閉。\n\n詳細資訊:\n{e}")
 
