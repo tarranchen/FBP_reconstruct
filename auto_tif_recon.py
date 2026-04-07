@@ -115,16 +115,14 @@ class TextRedirector:
         pass
 
 class TomoPipeline:
-    def __init__(self, config: Dict[str, Any], sample_dir: str, tif_dir: str, log_func):
+    def __init__(self, config: Dict[str, Any], sample_dir: str, log_func):
         self.config = config
         self.sample_dir = sample_dir
         self.log = log_func
         
         self.auto_raw_dir = os.path.join(sample_dir, AUTO_RAW_FOLDER_NAME)
-        self.tif_dir = tif_dir
+        self.tif_dir = os.path.join(sample_dir, TIF_FOLDER_NAME)
         self.base_name = os.path.basename(sample_dir)
-        if not self.base_name: # Handle case where sample_dir is a root directory (e.g., "C:\")
-            self.base_name = os.path.basename(tif_dir)
         
         self.data_volume = None
         self.projections = None
@@ -546,7 +544,8 @@ class App(tk.Tk):
 
         self.entries: Dict[str, tk.StringVar] = {}
         self.save_vars: Dict[str, tk.BooleanVar] = {}
-        self.folder_path = tk.StringVar(value="Ready. Select a TIF folder to start.")
+        self.folder_path = tk.StringVar(value="No folder selected")
+        self.is_monitoring = threading.Event()
 
         self._create_widgets()
         self._center_window()
@@ -633,8 +632,11 @@ class App(tk.Tk):
         monitor_frame = Frame(run_frame, pady=5)
         monitor_frame.pack(fill='x')
 
-        self.run_button = tk.Button(monitor_frame, text="Select TIF Folder & Run", command=self._select_folder_and_run)
-        self.run_button.pack(side="left", padx=(10, 5))
+        self.monitor_button = tk.Button(monitor_frame, text="Select Folder & Monitor", command=self._select_folder_and_monitor)
+        self.monitor_button.pack(side="left", padx=(10, 5))
+
+        self.stop_button = tk.Button(monitor_frame, text="Stop Monitoring", command=self._stop_monitoring, state="disabled")
+        self.stop_button.pack(side="left")
 
         log_frame = LabelFrame(main_frame, text="Log", padx=10, pady=10)
         log_frame.grid(row=3, column=0, padx=10, pady=5, sticky='nsew')
@@ -663,48 +665,76 @@ class App(tk.Tk):
         except ValueError:
             return None
 
-    def _select_folder_and_run(self):
-        tif_dir = filedialog.askdirectory(parent=self, title="Select Folder Containing TIF Projections")
-        if not tif_dir:
-            return
+    def _select_folder_and_monitor(self):
+        path = filedialog.askdirectory(parent=self, title="Select Monitoring Folder")
+        if path:
+            self.folder_path.set(path)
+            self.is_monitoring.clear()
 
-        sample_dir = os.path.dirname(tif_dir)
-        self.log(f"TIF folder selected: {tif_dir}")
-        self.log(f"Using parent as sample directory: {sample_dir}")
+            self.monitor_button.config(state="disabled")
+            self.stop_button.config(state="normal")
 
-        self.folder_path.set(f"Processing: {os.path.basename(sample_dir)}")
+            thread = threading.Thread(target=self._monitor_folder, args=(path,))
+            thread.daemon = True
+            thread.start()
 
+    def _monitor_folder(self, folder_path: str, check_interval: int = 5):
+        self.after_idle(self.log, f"Monitoring folder '{folder_path}' for new samples...")
+        try:
+            while not self.is_monitoring.is_set():
+                sample_to_process = None
+                for item in os.listdir(folder_path):
+                    sample_dir = os.path.join(folder_path, item)
+                    if not os.path.isdir(sample_dir):
+                        continue
+                    
+                    tif_dir = os.path.join(sample_dir, TIF_FOLDER_NAME)
+                    if os.path.isdir(tif_dir):
+                        tif_files = [f for f in os.listdir(tif_dir) if f.lower().endswith(('.tif', '.tiff'))]
+                        if len(tif_files) == 721:
+                            auto_raw_dir = os.path.join(sample_dir, AUTO_RAW_FOLDER_NAME)
+                            has_output = False
+                            if os.path.isdir(auto_raw_dir):
+                                output_files = [f for f in os.listdir(auto_raw_dir) if f.lower().endswith(('.tif', '.tiff'))]
+                                if len(output_files) > 0:
+                                    has_output = True
+                            
+                            if not has_output:
+                                sample_to_process = sample_dir
+                                break
+
+                if sample_to_process:
+                    self.after_idle(self.log, f"Trigger conditions met for sample: {os.path.basename(sample_to_process)}.")
+                    self._run_pipeline_sync(sample_to_process)
+                else:
+                    self.is_monitoring.wait(timeout=check_interval)
+        finally:
+            self.after_idle(self._on_monitoring_stopped)
+
+    def _run_pipeline_sync(self, sample_dir):
         config = self._get_user_params()
         if not config:
-            self.log("Error: Invalid parameters entered.")
+            self.after_idle(self.log, "Error parsing parameters. Stopping monitor.")
+            self.is_monitoring.set()
             return
-
-        self.run_button.config(state="disabled")
-
-        thread = threading.Thread(target=self._run_pipeline_thread, args=(config, sample_dir, tif_dir))
-        thread.daemon = True
-        thread.start()
-
-    def _run_pipeline_thread(self, config, sample_dir, tif_dir):
+            
         def log_safe(msg):
             self.after_idle(self.log, msg)
 
-        try:
-            pipeline = TomoPipeline(config, sample_dir, tif_dir, log_safe)
-            success = pipeline.run()
-            if success:
-                self.after_idle(self._on_processing_complete, True)
-            else:
-                self.after_idle(self.log, f"Pipeline failed for {os.path.basename(sample_dir)}.")
-                self.after_idle(self._on_processing_complete, False)
-        except Exception as e:
-            import traceback
-            self.after_idle(self.log, f"An unexpected error occurred: {e}")
-            self.after_idle(self.log, traceback.format_exc())
-            self.after_idle(self._on_processing_complete, False)
-        finally:
-            self.after_idle(lambda: self.run_button.config(state="normal"))
-            self.after_idle(lambda: self.folder_path.set("Ready. Select a TIF folder to start."))
+        pipeline = TomoPipeline(config, sample_dir, log_safe)
+        success = pipeline.run()
+        if success:
+            self.after_idle(self._on_processing_complete, True)
+        else:
+            self.after_idle(self.log, f"Pipeline failed for {os.path.basename(sample_dir)}.")
+
+    def _stop_monitoring(self):
+        self.is_monitoring.set()
+
+    def _on_monitoring_stopped(self):
+        self.log("Monitoring stopped.")
+        self.monitor_button.config(state="normal")
+        self.stop_button.config(state="disabled")
 
     def _on_processing_complete(self, success: bool):
         if success:
@@ -717,7 +747,7 @@ class App(tk.Tk):
             top.geometry(f"+{x}+{y}")
             self.after(1000, top.destroy)
         else:
-            messagebox.showerror("Error", "Task failed. Check log for details.")
+            messagebox.showerror("Error", "Task failed.")
 
     def _center_window(self):
         self.update_idletasks()
