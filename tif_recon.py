@@ -198,11 +198,13 @@ class TomoPipeline:
         if not os.path.isdir(self.tif_dir):
             self.log(f"Error: TIF directory not found at '{self.tif_dir}'. Aborting.")
             return False
-            
+
         tif_files = sorted([f for f in os.listdir(self.tif_dir) if f.lower().endswith(('.tif', '.tiff'))])
-        if len(tif_files) != 721:
-            self.log(f"Error: Expected 721 TIF files in {self.tif_dir}, but found {len(tif_files)}. Aborting.")
+        num_projections = len(tif_files)
+        if num_projections == 0:
+            self.log(f"Error: No TIF files found in {self.tif_dir}. Aborting.")
             return False
+        self.log(f"Found {num_projections} TIF files.")
 
         center_idx = None
         center_file = next((f for f in os.listdir(self.sample_dir) if f.endswith('.auto_detected_center')), None)
@@ -244,11 +246,11 @@ class TomoPipeline:
         binned_height, binned_width = test_binned.shape
         self.log(f"Binned dimensions: {binned_width}x{binned_height}")
 
-        self.projections = np.zeros((721, binned_height, binned_width), dtype=np.float32)
-        self.angles_rad = np.deg2rad(np.linspace(0, 180, 721, endpoint=False, dtype=np.float32))
+        self.projections = np.zeros((num_projections, binned_height, binned_width), dtype=np.float32)
+        self.angles_rad = np.deg2rad(np.linspace(0, 180, num_projections, endpoint=False, dtype=np.float32))
 
-        self.log(f"Processing 721 projections (Load TIF -> Crop -> Bin -> Log)...")
-        update_interval = max(1, 721 // 10)
+        self.log(f"Processing {num_projections} projections (Load TIF -> Crop -> Bin -> Log)...")
+        update_interval = max(1, num_projections // 10)
 
         for i, tif_name in enumerate(tif_files):
             tif_path = os.path.join(self.tif_dir, tif_name)
@@ -268,8 +270,8 @@ class TomoPipeline:
             absorption_data = -np.log(np.maximum(binned, 1e-9))
             self.projections[i, :, :] = absorption_data
 
-            if (i + 1) % update_interval == 0 or (i + 1) == 721:
-                self.log(f"  > Processed: {i + 1} / 721 ({(i + 1) / 721:.0%})")
+            if (i + 1) % update_interval == 0 or (i + 1) == num_projections:
+                self.log(f"  > Processed: {i + 1} / {num_projections} ({(i + 1) / num_projections:.0%})")
 
         return True
 

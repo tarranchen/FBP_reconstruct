@@ -102,21 +102,33 @@ def main():
         print("pip install numpy tifffile")
         return
 
-    # 使用 Tkinter GUI 讓使用者選擇檔案
+    # 使用 Tkinter GUI 讓使用者選擇資料夾
     root = tk.Tk()
     root.withdraw()  # 隱藏主視窗
     
-    print("請在彈出視窗中選擇兩個已扣好背的 32-bit TIF 檔案 (分別代表0度與180度)...")
-    file_paths = filedialog.askopenfilenames(
-        title="請選擇兩個 TIF 檔案",
-        filetypes=[("TIF Files", "*.tif;*.tiff"), ("All Files", "*.*")]
+    print("請在彈出視窗中選擇包含已扣好背 TIF 投影的資料夾...")
+    tif_dir = filedialog.askdirectory(
+        title="請選擇 TIF 檔案所在的資料夾"
     )
 
-    if not file_paths or len(file_paths) != 2:
-        print("您必須選擇剛好兩個 TIF 檔案，程式即將結束。")
+    if not tif_dir:
+        print("未選擇任何資料夾，程式即將結束。")
         return
 
-    tif_path0, tif_path180 = file_paths[0], file_paths[1]
+    # 尋找資料夾中的 TIF 檔案
+    try:
+        tif_files = sorted([f for f in os.listdir(tif_dir) if f.lower().endswith(('.tif', '.tiff'))])
+    except Exception as e:
+        print(f"讀取資料夾 '{tif_dir}' 時發生錯誤: {e}")
+        return
+
+    if len(tif_files) < 2:
+        print(f"錯誤：在資料夾 '{tif_dir}' 中需要至少兩個 TIF 檔案，但只找到 {len(tif_files)} 個。")
+        return
+
+    # 選擇數字最小和最大的檔案 (排序後的第一個和最後一個)
+    tif_path0 = os.path.join(tif_dir, tif_files[0])
+    tif_path180 = os.path.join(tif_dir, tif_files[-1])
     calculate_center_of_rotation(tif_path0, tif_path180)
 
 if __name__ == "__main__":
